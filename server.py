@@ -16,6 +16,12 @@ CONFIGS = {
 }
 CPU_NAMES = ['ハル','ユキ','アオイ','カイ','リン','ソラ','ナギ','ツバキ','コウ','アン']
 DISC_ROUNDS = 2
+READ_PAUSE_MIN = 1.4
+READ_PAUSE_MAX = 7.0
+
+def read_pause(text):
+    length = len(text or '')
+    return max(READ_PAUSE_MIN, min(READ_PAUSE_MAX, 1.0 + length * 0.075))
 
 # CPU テンプレート
 CPU_T = {
@@ -78,6 +84,7 @@ def new_room(code):
         'wolf_chat': [], 'wolf_done': set(),
         'night_actions': {}, 'night_pending': set(),
         'votes': {}, 'vote_pending': set(), 'log': [],
+        'vote_ready': set(),
         'desired_cpu': 0,
     }
 
@@ -274,6 +281,7 @@ async def start_discussion(room, elim=None):
     room['phase'] = 'discuss'
     room['disc_msgs'] = []
     room['disc_round'] = 1
+    room['vote_ready'] = set()
     alive_pids = [pid for pid, p in room['players'].items() if p['alive']]
     random.shuffle(alive_pids)
     room['disc_order'] = alive_pids
@@ -284,6 +292,15 @@ async def start_discussion(room, elim=None):
         'round': 1, 'total_rounds': DISC_ROUNDS,
     })
     await _next_disc(room)
+
+async def _check_vote_ready(room):
+    if room['phase'] != 'discuss': return
+    alive_human_pids = {pid for pid, p in room['players'].items() if p['alive'] and pid not in room['cpu_pids']}
+    if alive_human_pids and room['vote_ready'].issuperset(alive_human_pids):
+        await bcast(room, {'type': 'vote_ready_all'})
+        await asyncio.sleep(1.7)
+        if room['phase'] == 'discuss':
+            await start_vote(room)
 
 async def _next_disc(room):
     if room['phase'] != 'discuss': return
@@ -315,11 +332,14 @@ async def _cpu_discuss(room, cpu_pid):
     msg = cpu_template(room, cpu_pid)
     await _post_disc_msg(room, cpu_pid, msg)
 
-async def _post_disc_msg(room, pid, text):
+async def _post_disc_msg(room, pid, text, advance_turn=True):
     p = room['players'][pid]
     room['disc_msgs'].append({'name': p['name'], 'text': text})
     await bcast(room, {'type': 'disc_message', 'name': p['name'], 'text': text})
+    if not advance_turn:
+        return
     room['disc_step'] += 1
+    await asyncio.sleep(read_pause(text))
     await _next_disc(room)
 
 # ── 投票 ────────────────────────────────────────────────────
@@ -435,9 +455,26 @@ async def handle(ws, pid, room, data):
 
     elif t == 'disc_message':
         if room['phase'] != 'discuss': return
+        p = room['players'].get(pid)
+        if not p or not p.get('alive'): return
+        text = str(data.get('text', '')).strip()[:220]
+        if not text: return
         order = room['disc_order']
-        if room['disc_step'] < len(order) and order[room['disc_step']] == pid:
-            await _post_disc_msg(room, pid, str(data.get('text', ''))[:100])
+        is_turn = room['disc_step'] < len(order) and order[room['disc_step']] == pid
+        await _post_disc_msg(room, pid, text, advance_turn=is_turn)
+
+    elif t == 'vote_ready':
+        if room['phase'] != 'discuss': return
+        p = room['players'].get(pid)
+        if not p or not p.get('alive'): return
+        room['vote_ready'].add(pid)
+        ready_names = [room['players'][rid]['name'] for rid in room['vote_ready'] if rid in room['players']]
+        await bcast(room, {'type': 'vote_ready_upd', 'readyNames': ready_names})
+        await _check_vote_ready(room)
+
+    elif t == 'music_ended':
+        if room['phase'] == 'discuss':
+            await start_vote(room)
 
     elif t == 'vote':
         p = room['players'].get(pid)
